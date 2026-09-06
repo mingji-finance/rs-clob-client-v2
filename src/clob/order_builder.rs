@@ -198,7 +198,8 @@ impl<OrderKind, K: AuthKind> OrderBuilder<OrderKind, K> {
                 let timestamp_ms = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .expect("time went backwards")
-                    .as_millis();
+                    .as_millis()
+                    .saturating_sub(2 * 60 * 1000);
                 Ok(OrderPayload::new(
                     OrderV2 {
                         salt: U256::from(salt),

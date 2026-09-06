@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::hash::Hash;
 use std::marker::PhantomData;
 use std::mem;
 use std::sync::Arc;
@@ -13,7 +14,6 @@ use alloy::sol_types::SolValue as _;
 use async_stream::try_stream;
 use bon::Builder;
 use chrono::{NaiveDate, Utc};
-use dashmap::DashMap;
 use futures::Stream;
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::{Client as ReqwestClient, Method, Request};
@@ -88,6 +88,23 @@ pub(crate) const ORDER_VERSION_MISMATCH_ERROR: &str = "order_version_mismatch";
 
 const RESOLVE_TRADES_TIMEOUT: Duration = Duration::from_secs(30);
 const RESOLVE_TRADES_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+// Idle-eviction window and capacity bound for the per-token market caches.
+// Entries that stop being read (e.g. expired 5-minute markets) age out
+// automatically instead of accumulating for the lifetime of the client.
+const CACHE_IDLE_TTL: Duration = Duration::from_secs(3600);
+const CACHE_MAX_ENTRIES: u64 = 10_000;
+
+fn market_cache<K, V>() -> moka::sync::Cache<K, V>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+{
+    moka::sync::Cache::builder()
+        .time_to_idle(CACHE_IDLE_TTL)
+        .max_capacity(CACHE_MAX_ENTRIES)
+        .build()
+}
 
 // A trade is resolved once execution reached a terminal outcome: it either
 // carries a settlement transaction hash or it failed and never will.
@@ -474,17 +491,17 @@ struct ClientInner<S: State> {
     /// The inner [`ReqwestClient`] used to make requests to `host`.
     client: ReqwestClient,
     /// Local cache of [`TickSize`] per token ID
-    tick_sizes: DashMap<U256, TickSize>,
+    tick_sizes: moka::sync::Cache<U256, TickSize>,
     /// Local cache representing whether this token is part of a `neg_risk` market
-    neg_risk: DashMap<U256, bool>,
+    neg_risk: moka::sync::Cache<U256, bool>,
     /// V1 `/fee-rate` cache. V2 fee calculation uses [`Self::fee_infos`] instead.
-    fee_rate_bps: DashMap<U256, FeeRateResponse>,
+    fee_rate_bps: moka::sync::Cache<U256, FeeRateResponse>,
     /// V2 fee parameters from `/clob-markets/{id}` `fd`, used for market-order fee sizing.
-    fee_infos: DashMap<U256, FeeInfo>,
+    fee_infos: moka::sync::Cache<U256, FeeInfo>,
     /// Caches `token_id -> condition_id` to avoid repeated `/markets-by-token` calls.
-    token_condition_map: DashMap<U256, B256>,
+    token_condition_map: moka::sync::Cache<U256, B256>,
     /// Local cache of builder fee rates per builder code
-    builder_fee_rates: DashMap<B256, BuilderFeeRateResponse>,
+    builder_fee_rates: moka::sync::Cache<B256, BuilderFeeRateResponse>,
     /// Lazily resolved CLOB protocol version. `0` means uncached.
     cached_version: AtomicU32,
     /// The funder for this [`ClientInner`]. If funder is present, then `signature_type` cannot
@@ -586,16 +603,19 @@ impl<S: State> Client<S> {
         &self.inner.host
     }
 
-    /// Invalidates all internal caches (tick sizes, neg risk flags, and fee rates).
+    /// Invalidates all internal caches (tick sizes, neg risk flags, fee rates,
+    /// fee infos, token-condition mappings, and builder fee rates).
     ///
     /// This method clears the cached market configuration data, forcing subsequent
     /// requests to fetch fresh data from the API. Use this when you suspect
     /// cached data may be stale.
     pub fn invalidate_internal_caches(&self) {
-        self.inner.tick_sizes.clear();
-        self.inner.fee_rate_bps.clear();
-        self.inner.neg_risk.clear();
-        self.inner.builder_fee_rates.clear();
+        self.inner.tick_sizes.invalidate_all();
+        self.inner.fee_rate_bps.invalidate_all();
+        self.inner.neg_risk.invalidate_all();
+        self.inner.builder_fee_rates.invalidate_all();
+        self.inner.fee_infos.invalidate_all();
+        self.inner.token_condition_map.invalidate_all();
     }
 
     /// Pre-populates the tick size cache for a token, avoiding the HTTP call.
@@ -876,9 +896,9 @@ impl<S: State> Client<S> {
     pub async fn tick_size(&self, token_id: U256) -> Result<TickSizeResponse> {
         if let Some(tick_size) = self.inner.tick_sizes.get(&token_id) {
             #[cfg(feature = "tracing")]
-            tracing::trace!(token_id = %token_id, tick_size = ?tick_size.value(), "cache hit: tick_size");
+            tracing::trace!(token_id = %token_id, tick_size = ?tick_size, "cache hit: tick_size");
             return Ok(TickSizeResponse {
-                minimum_tick_size: *tick_size,
+                minimum_tick_size: tick_size,
             });
         }
 
@@ -916,10 +936,8 @@ impl<S: State> Client<S> {
     pub async fn neg_risk(&self, token_id: U256) -> Result<NegRiskResponse> {
         if let Some(neg_risk) = self.inner.neg_risk.get(&token_id) {
             #[cfg(feature = "tracing")]
-            tracing::trace!(token_id = %token_id, neg_risk = *neg_risk, "cache hit: neg_risk");
-            return Ok(NegRiskResponse {
-                neg_risk: *neg_risk,
-            });
+            tracing::trace!(token_id = %token_id, neg_risk = neg_risk, "cache hit: neg_risk");
+            return Ok(NegRiskResponse { neg_risk });
         }
 
         #[cfg(feature = "tracing")]
@@ -953,7 +971,7 @@ impl<S: State> Client<S> {
         if let Some(cached) = self.inner.fee_rate_bps.get(&token_id) {
             #[cfg(feature = "tracing")]
             tracing::trace!(token_id = %token_id, base_fee = cached.base_fee, "cache hit: fee_rate_bps");
-            return Ok(cached.clone());
+            return Ok(cached);
         }
 
         #[cfg(feature = "tracing")]
@@ -1364,7 +1382,7 @@ impl<S: State> Client<S> {
             return Ok(());
         }
         let condition_id = if let Some(cid) = self.inner.token_condition_map.get(&token_id) {
-            *cid
+            cid
         } else {
             let market = self.market_by_token(token_id).await?;
             self.inner
@@ -1383,12 +1401,7 @@ impl<S: State> Client<S> {
     /// Returns an error if market metadata cannot be resolved.
     pub(crate) async fn fee_info(&self, token_id: U256) -> Result<FeeInfo> {
         self.ensure_market_info_cached(token_id).await?;
-        Ok(self
-            .inner
-            .fee_infos
-            .get(&token_id)
-            .map(|e| *e)
-            .unwrap_or_default())
+        Ok(self.inner.fee_infos.get(&token_id).unwrap_or_default())
     }
 
     /// Looks up a market by token ID.
@@ -1506,12 +1519,12 @@ impl Client<Unauthenticated> {
                 host: Url::parse(host)?,
                 geoblock_host,
                 client,
-                tick_sizes: DashMap::new(),
-                neg_risk: DashMap::new(),
-                fee_rate_bps: DashMap::new(),
-                fee_infos: DashMap::new(),
-                token_condition_map: DashMap::new(),
-                builder_fee_rates: DashMap::new(),
+                tick_sizes: market_cache(),
+                neg_risk: market_cache(),
+                fee_rate_bps: market_cache(),
+                fee_infos: market_cache(),
+                token_condition_map: market_cache(),
+                builder_fee_rates: market_cache(),
                 cached_version: AtomicU32::new(0),
                 state: Unauthenticated,
                 funder: None,
