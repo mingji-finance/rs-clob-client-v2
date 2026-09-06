@@ -131,3 +131,4 @@ http-client.private.env.json
 # ------- </VSCode> -------
 
 specs/*
+claude_code_env.sh
