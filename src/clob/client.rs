@@ -458,6 +458,11 @@ pub struct Config {
     /// Default builder code inherited by orders built via [`Client::limit_order`] or
     /// [`Client::market_order`] when not set on the order itself.
     builder_code: Option<B256>,
+    /// Connection pool idle timeout passed through to the underlying HTTP client.
+    /// `None` (the default) keeps the client's own default (reqwest: 90 seconds).
+    /// Set this above the expected gap between requests — otherwise every call
+    /// after an idle period pays a fresh TCP + TLS handshake.
+    pool_idle_timeout: Option<Duration>,
     #[cfg(feature = "heartbeats")]
     #[builder(default = Duration::from_secs(5))]
     /// How often the [`Client`] will automatically submit heartbeats. The default is five (5) seconds.
@@ -470,6 +475,7 @@ impl Default for Config {
             use_server_time: false,
             geoblock_host: None,
             builder_code: None,
+            pool_idle_timeout: None,
             #[cfg(feature = "heartbeats")]
             heartbeat_interval: Duration::from_secs(5),
         }
@@ -1504,7 +1510,11 @@ impl Client<Unauthenticated> {
         headers.insert("Connection", HeaderValue::from_static("keep-alive"));
         headers.insert("Content-Type", HeaderValue::from_static("application/json"));
 
-        let client = ReqwestClient::builder().default_headers(headers).build()?;
+        let mut http = ReqwestClient::builder().default_headers(headers);
+        if let Some(timeout) = config.pool_idle_timeout {
+            http = http.pool_idle_timeout(timeout);
+        }
+        let client = http.build()?;
 
         let geoblock_host = Url::parse(
             config
